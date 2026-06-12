@@ -345,11 +345,29 @@ wick = base.mark_rule().encode(
 body = base.mark_bar(size=6).encode(
     x=x_enc, y="open:Q", y2="close:Q",
     color=alt.condition("datum.up", alt.value(UP), alt.value(DOWN)))
-ma_b = base.mark_line(color="#2196f3", strokeWidth=1.5).encode(x=x_enc, y="ma_buy:Q")
-ma_s = base.mark_line(color="#ff9800", strokeWidth=1.5).encode(x=x_enc, y="ma_sell:Q")
-st.altair_chart((wick + body + ma_b + ma_s).properties(height=340),
-                use_container_width=True)
-st.caption(f"🕯️ {symbol} | น้ำเงิน=MA{ma_buy}(ซื้อ) | ส้ม=MA{ma_sell}(ขาย) | เขียว=ขึ้น แดง=ลง")
+
+# เส้น MA แบบมี legend บนกราฟ: ซื้อ=น้ำเงินทึบ / ขาย=ส้มเส้นประ
+buy_lbl, sell_lbl = f"MA ซื้อ ({ma_buy})", f"MA ขาย ({ma_sell})"
+ma_long = plot_df.melt(id_vars=["label", "order"],
+                       value_vars=["ma_buy", "ma_sell"],
+                       var_name="ma_type", value_name="ma_val")
+ma_long["ma_type"] = ma_long["ma_type"].map({"ma_buy": buy_lbl, "ma_sell": sell_lbl})
+ma_line = alt.Chart(ma_long).mark_line(strokeWidth=2.2).encode(
+    x=x_enc,
+    y=alt.Y("ma_val:Q", scale=alt.Scale(zero=False)),
+    color=alt.Color("ma_type:N",
+                    scale=alt.Scale(domain=[buy_lbl, sell_lbl],
+                                    range=["#2196f3", "#ff9800"]),
+                    legend=alt.Legend(title=None, orient="top", labelFontSize=13)),
+    strokeDash=alt.StrokeDash("ma_type:N",
+                              scale=alt.Scale(domain=[buy_lbl, sell_lbl],
+                                              range=[[1, 0], [6, 4]]),
+                              legend=None))
+
+chart = (wick + body + ma_line).properties(height=340).resolve_scale(color="independent")
+st.altair_chart(chart, use_container_width=True)
+st.caption(f"🕯️ {symbol} | เขียว=แท่งขึ้น  แดง=แท่งลง  "
+           f"(น้ำเงินทึบ=MA ซื้อ, ส้มเส้นประ=MA ขาย)")
 
 # ---- ประวัติสัญญาณ ----
 if st.session_state.get("signal_log"):
