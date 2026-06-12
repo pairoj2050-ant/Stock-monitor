@@ -182,8 +182,18 @@ with st.sidebar:
                    unsafe_allow_html=True)
         return b
 
+    st.session_state.setdefault("symbol_input", "SINGER")
     symbol = row("Symbol").text_input(
-        "s", value="SINGER", label_visibility="collapsed").strip().upper()
+        "s", key="symbol_input", label_visibility="collapsed").strip().upper()
+
+    recent = st.session_state.setdefault("recent", [])
+    if recent:
+        def _pick_recent():
+            v = st.session_state.get("recent_pick")
+            if v and v != "—":
+                st.session_state.symbol_input = v
+        row("เคยดู").selectbox("rp", ["—"] + recent, key="recent_pick",
+                              label_visibility="collapsed", on_change=_pick_recent)
     tf_label = row("Timeframe").selectbox(
         "tf", list(INTERVALS.keys()), index=3, label_visibility="collapsed")
     interval = INTERVALS[tf_label]
@@ -200,12 +210,15 @@ with st.sidebar:
     ignore_forming = st.checkbox("ไม่นับแท่งที่กำลังวิ่ง (แนะนำเปิด)", value=True)
 
     st.divider()
-    price_filter_on = st.checkbox(
-        "กรองด้วยช่วงราคา (เฉพาะสัญญาณซื้อ)", value=True,
-        help="เตือนซื้อเฉพาะตอนราคาอยู่ในช่วงที่ตั้งไว้ เช่น 6–10 บาท")
-    price_min = row("ราคาต่ำสุด").number_input(
+    price_filter_on = st.checkbox("กรองด้วยช่วงราคา (เฉพาะสัญญาณซื้อ)", value=True)
+    auto_band = st.checkbox(
+        "ช่วงราคาอัตโนมัติ (±% จากราคาปัจจุบัน)", value=True,
+        help="ตั้งช่วงเป็น ราคาปัจจุบัน ±% ให้เอง เปลี่ยนหุ้นแล้วช่วงปรับตามอัตโนมัติ")
+    band_pct = row("± %").number_input(
+        "bp", 1.0, 90.0, 20.0, 1.0, label_visibility="collapsed")
+    price_min = row("ต่ำสุด (แมนนวล)").number_input(
         "pmin", 0.0, 10000.0, 6.0, 0.5, label_visibility="collapsed")
-    price_max = row("ราคาสูงสุด").number_input(
+    price_max = row("สูงสุด (แมนนวล)").number_input(
         "pmax", 0.0, 10000.0, 10.0, 0.5, label_visibility="collapsed")
 
     st.divider()
@@ -221,6 +234,13 @@ if df.empty:
     st.error(f"ดึงข้อมูล {symbol} ({tf_label}) ไม่ได้ — เช็คชื่อหุ้น (เช่น SINGER, "
              f"CBG, PTT) หรือลองเปลี่ยน timeframe / กดดึงข้อมูลใหม่อีกครั้ง")
     st.stop()
+
+# เก็บประวัติหุ้นที่เคยดู (ล่าสุดอยู่บน สูงสุด 10 ตัว)
+_rec = st.session_state.recent
+if symbol in _rec:
+    _rec.remove(symbol)
+_rec.insert(0, symbol)
+del _rec[10:]
 
 df = add_ma(df, ma_buy, "ma_buy")
 df = add_ma(df, ma_sell, "ma_sell")
@@ -240,7 +260,13 @@ bar_id = str(last["time"])
 price_latest = float(df.iloc[-1]["close"])             # ราคาล่าสุด (แท่งปัจจุบัน)
 last_time = pd.Timestamp(df.iloc[-1]["time"])
 
-in_band = (price_min <= price <= price_max)
+if auto_band:
+    band_lo = round(price_latest * (1 - band_pct / 100), 2)
+    band_hi = round(price_latest * (1 + band_pct / 100), 2)
+else:
+    band_lo, band_hi = price_min, price_max
+
+in_band = (band_lo <= price <= band_hi)
 buy_blocked = buy_sig and price_filter_on and not in_band
 if buy_blocked:
     buy_sig = False
@@ -277,9 +303,12 @@ elif sell_sig:
 else:
     st.warning("⏳ รอสัญญาณ — ยังไม่เข้าเงื่อนไข")
 
+if price_filter_on:
+    tag = f"±{band_pct:.0f}% อัตโนมัติ" if auto_band else "แมนนวล"
+    st.caption(f"🔎 ช่วงราคาที่เฝ้าซื้อ: {band_lo:.2f}–{band_hi:.2f} ({tag})")
 if buy_blocked:
     st.caption(f"ℹ️ เข้าเงื่อนไขซื้อ แต่ราคา {price:.2f} อยู่นอกช่วง "
-               f"{price_min:.2f}–{price_max:.2f} จึงไม่เตือน")
+               f"{band_lo:.2f}–{band_hi:.2f} จึงไม่เตือน")
 
 # ---- เสียงเตือน + ปุ่มดับ ----
 if alarm_on:
