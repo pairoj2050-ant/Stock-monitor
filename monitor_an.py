@@ -77,25 +77,57 @@ def bars_above_below(df, ma_col):
 # ===========================================================================
 # DATA (Yahoo Finance)
 # ===========================================================================
-@st.cache_data(ttl=60)
-def get_data(symbol: str, interval: str) -> pd.DataFrame:
-    import yfinance as yf
-    yf_symbol = symbol if "." in symbol else f"{symbol}.BK"
-    period = "2y" if interval == "1d" else "3mo"
-    raw = yf.download(yf_symbol, period=period, interval=interval,
-                      progress=False, auto_adjust=False)
+def _to_df(raw):
     if raw is None or raw.empty:
         return pd.DataFrame()
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
-    out = pd.DataFrame({
+    return pd.DataFrame({
         "time": raw.index,
         "open": pd.to_numeric(raw["Open"], errors="coerce"),
         "high": pd.to_numeric(raw["High"], errors="coerce"),
         "low": pd.to_numeric(raw["Low"], errors="coerce"),
         "close": pd.to_numeric(raw["Close"], errors="coerce"),
     }).dropna().reset_index(drop=True)
-    return out
+
+
+def _resample_intraday(df, rule):
+    """รวมแท่งย่อยเป็นแท่งใหญ่ (เช่น 15m -> 45m) แยกตามวัน ให้ตรงเวลาเปิดตลาด"""
+    if df.empty:
+        return df
+    d = df.set_index("time")
+    frames = []
+    for _, g in d.groupby(d.index.normalize()):
+        r = g.resample(rule, origin="start").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+        frames.append(r)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames).reset_index()
+
+
+@st.cache_data(ttl=45)
+def get_data(symbol: str, interval: str) -> pd.DataFrame:
+    import yfinance as yf
+    yf_symbol = symbol if "." in symbol else f"{symbol}.BK"
+
+    # 45 นาที: Yahoo ไม่มีให้ตรงๆ -> ดึง 15 นาทีมารวมเป็น 45 นาที
+    if interval == "45m":
+        raw = yf.download(yf_symbol, period="1mo", interval="15m",
+                          progress=False, auto_adjust=False)
+        return _resample_intraday(_to_df(raw), "45min")
+
+    # เลือกช่วงเวลาตามขีดจำกัด Yahoo (15/30 นาที ย้อนได้แค่ ~60 วัน)
+    if interval == "1d":
+        period = "2y"
+    elif interval in ("60m", "90m"):
+        period = "3mo"
+    else:                       # 15m, 30m
+        period = "1mo"
+
+    raw = yf.download(yf_symbol, period=period, interval=interval,
+                      progress=False, auto_adjust=False)
+    return _to_df(raw)
 
 
 # ===========================================================================
@@ -138,7 +170,8 @@ def play_loop(data: bytes):
 st.set_page_config(page_title="MA Signal Monitor", page_icon="📡",
                    layout="wide", initial_sidebar_state="collapsed")
 
-INTERVALS = {"15 นาที": "15m", "30 นาที": "30m", "60 นาที": "60m", "รายวัน": "1d"}
+INTERVALS = {"15 นาที": "15m", "30 นาที": "30m", "45 นาที": "45m",
+             "60 นาที": "60m", "รายวัน": "1d"}
 
 with st.sidebar:
     st.header("⚙️ ตั้งค่า")
@@ -152,7 +185,7 @@ with st.sidebar:
     symbol = row("Symbol").text_input(
         "s", value="SINGER", label_visibility="collapsed").strip().upper()
     tf_label = row("Timeframe").selectbox(
-        "tf", list(INTERVALS.keys()), index=2, label_visibility="collapsed")
+        "tf", list(INTERVALS.keys()), index=3, label_visibility="collapsed")
     interval = INTERVALS[tf_label]
 
     st.divider()
@@ -185,7 +218,8 @@ with st.sidebar:
 # ---- โหลดข้อมูล ----
 df = get_data(symbol, interval)
 if df.empty:
-    st.error(f"ดึงข้อมูล {symbol} ไม่ได้ — เช็คชื่อหุ้น (เช่น SINGER, CBG, PTT)")
+    st.error(f"ดึงข้อมูล {symbol} ({tf_label}) ไม่ได้ — เช็คชื่อหุ้น (เช่น SINGER, "
+             f"CBG, PTT) หรือลองเปลี่ยน timeframe / กดดึงข้อมูลใหม่อีกครั้ง")
     st.stop()
 
 df = add_ma(df, ma_buy, "ma_buy")
@@ -201,8 +235,10 @@ buy_sig = check_buy(df_eval, touch_tol)
 sell_sig = check_sell(df_eval, touch_tol)
 
 last = df_eval.iloc[-1]
-price = float(last.close)
+price = float(last.close)          # ราคาแท่งที่ปิดแล้ว (ใช้ตัดสินสัญญาณ)
 bar_id = str(last["time"])
+price_latest = float(df.iloc[-1]["close"])             # ราคาล่าสุด (แท่งปัจจุบัน)
+last_time = pd.Timestamp(df.iloc[-1]["time"])
 
 in_band = (price_min <= price <= price_max)
 buy_blocked = buy_sig and price_filter_on and not in_band
@@ -225,11 +261,13 @@ alarm_on = bool(fired) and sound_on and not st.session_state.get("alarm_dismisse
 st.markdown("#### 📡 MA Signal Monitor")
 st.markdown(
     f"<div style='font-size:1.05rem'>"
-    f"<b>{symbol}</b>　ราคา <b style='font-size:1.3rem'>{price:.2f}</b>　·　"
+    f"<b>{symbol}</b>　ราคา <b style='font-size:1.3rem'>{price_latest:.2f}</b>　·　"
     f"MA{ma_buy}(ซื้อ) {last.ma_buy:.2f}　·　MA{ma_sell}(ขาย) {last.ma_sell:.2f}"
     f"</div>", unsafe_allow_html=True)
 st.caption(f"vs MA ซื้อ: {bars_above_below(df_eval, 'ma_buy')}　|　"
            f"vs MA ขาย: {bars_above_below(df_eval, 'ma_sell')}")
+st.caption(f"⏱️ แท่งล่าสุด: {last_time.strftime('%d/%m %H:%M')} "
+           f"(Yahoo ดีเลย์ ~15 นาที • สัญญาณคิดจากแท่งที่ปิดแล้ว @ {price:.2f})")
 
 # ---- แบนเนอร์สัญญาณ ----
 if buy_sig:
