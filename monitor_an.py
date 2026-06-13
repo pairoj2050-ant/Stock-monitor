@@ -156,12 +156,21 @@ BEEP_BUY = _wav([(880, 0.15), (None, 0.85)])
 BEEP_SELL = _wav([(990, 0.12), (None, 0.08), (990, 0.12), (None, 0.68)])
 
 
-def play_loop(data: bytes):
+@st.cache_data(ttl=86400)
+def thai_tts(text: str) -> bytes:
+    """แปลงข้อความไทยเป็นเสียงพูด (mp3) ด้วย Google TTS — ต้องมีเน็ต"""
+    from gtts import gTTS
+    buf = io.BytesIO()
+    gTTS(text=text, lang="th").write_to_fp(buf)
+    return buf.getvalue()
+
+
+def play_loop(data: bytes, fmt: str = "audio/wav"):
     """เล่นเสียงวนต่อเนื่อง (รองรับ loop ถ้า Streamlit เวอร์ชันใหม่)"""
     try:
-        st.audio(data, format="audio/wav", autoplay=True, loop=True)
+        st.audio(data, format=fmt, autoplay=True, loop=True)
     except TypeError:
-        st.audio(data, format="audio/wav", autoplay=True)
+        st.audio(data, format=fmt, autoplay=True)
 
 
 # ===========================================================================
@@ -203,6 +212,8 @@ with st.sidebar:
                                          label_visibility="collapsed")
     ma_sell = row("MA ขาย").number_input("ms", 2, 200, 13, 1,
                                          label_visibility="collapsed")
+    ma_trend = row("MA เทรน").number_input("mt", 2, 400, 50, 1,
+                                          label_visibility="collapsed")
     touch_tol = row("Tolerance %").number_input(
         "tt", 0.0, 2.0, 0.1, 0.05, label_visibility="collapsed") / 100
     chart_days = row("กราฟย้อนหลัง (วัน)").number_input(
@@ -223,6 +234,9 @@ with st.sidebar:
 
     st.divider()
     sound_on = st.checkbox("🔔 เปิดเสียงเตือน", value=True)
+    sound_mode = st.radio("ชนิดเสียง", ["พูดไทย", "บี๊บ"], horizontal=True)
+    say_buy = st.text_input("ข้อความตอนซื้อ", value="สัญญาณซื้อ")
+    say_sell = st.text_input("ข้อความตอนขาย", value="ดอยแน่ ดอยแน่")
     auto_refresh_sec = row("รีเฟรช (วิ) 0=ปิด").number_input(
         "ar", 0, 3600, 60, 10, label_visibility="collapsed")
     st.button("🔄 ดึงข้อมูลใหม่", use_container_width=True,
@@ -244,10 +258,12 @@ del _rec[10:]
 
 df = add_ma(df, ma_buy, "ma_buy")
 df = add_ma(df, ma_sell, "ma_sell")
+df = add_ma(df, ma_trend, "ma_trend")
 
-need = max(ma_buy, ma_sell) + 2
+need = max(ma_buy, ma_sell, ma_trend) + 2
 if len(df) < need:
-    st.error(f"ข้อมูลไม่พอ: ต้องการ {need} แท่ง (มี {len(df)}) ลองลดค่า MA")
+    st.error(f"ข้อมูลไม่พอ: ต้องการ {need} แท่ง (มี {len(df)}) ลองลดค่า MA "
+             f"(โดยเฉพาะ MA เทรน) หรือเพิ่มช่วงเวลา/วันย้อนหลัง")
     st.stop()
 
 df_eval = df.iloc[:-1].copy() if ignore_forming and len(df) > 1 else df.copy()
@@ -273,6 +289,18 @@ if buy_blocked:
 
 fired = "ซื้อ" if buy_sig else ("ขาย" if sell_sig else None)
 
+# ---- สถานะเทรน จากเส้น MA เทรน (ราคาเทียบเส้น + ทิศของเส้น) ----
+trend_val = float(last.ma_trend)
+trend_prev = float(df_eval.iloc[-2].ma_trend) if len(df_eval) >= 2 else trend_val
+slope_up = trend_val >= trend_prev
+above = price >= trend_val
+if above and slope_up:
+    trend_txt, trend_kind = "📈 เทรนขาขึ้น", "up"
+elif (not above) and (not slope_up):
+    trend_txt, trend_kind = "📉 เทรนขาลง", "down"
+else:
+    trend_txt, trend_kind = "↔️ เทรนไม่ชัด (sideway)", "flat"
+
 # ===========================================================================
 # ระบบเตือนซ้ำจนกดดับ (รีเซ็ตเมื่อมีสัญญาณ "ใหม่")
 # ===========================================================================
@@ -295,6 +323,13 @@ st.caption(f"vs MA ซื้อ: {bars_above_below(df_eval, 'ma_buy')}　|　"
 st.caption(f"⏱️ แท่งล่าสุด: {last_time.strftime('%d/%m %H:%M')} "
            f"(Yahoo ดีเลย์ ~15 นาที • สัญญาณคิดจากแท่งที่ปิดแล้ว @ {price:.2f})")
 
+# ---- หัวข้อเทรน ----
+_tcolor = {"up": "#1b8a3a", "down": "#c62828", "flat": "#8a6d00"}[trend_kind]
+st.markdown(
+    f"<div style='font-size:1.25rem;font-weight:700;color:{_tcolor};"
+    f"margin:4px 0'>{trend_txt} <span style='font-size:0.9rem;font-weight:400'>"
+    f"(MA เทรน {ma_trend} = {trend_val:.2f})</span></div>", unsafe_allow_html=True)
+
 # ---- แบนเนอร์สัญญาณ ----
 if buy_sig:
     st.success(f"🟢 **สัญญาณซื้อ {symbol} @ {price:.2f}** — 2 แท่งปิดแตะ/เหนือ MA ซื้อ")
@@ -312,7 +347,16 @@ if buy_blocked:
 
 # ---- เสียงเตือน + ปุ่มดับ ----
 if alarm_on:
-    play_loop(BEEP_BUY if fired == "ซื้อ" else BEEP_SELL)
+    used_voice = False
+    if sound_mode == "พูดไทย":
+        try:
+            phrase = say_buy if fired == "ซื้อ" else say_sell
+            play_loop(thai_tts(phrase), "audio/mp3")
+            used_voice = True
+        except Exception:
+            st.caption("⚠️ เสียงพูดไทยใช้ไม่ได้ (เน็ต/gTTS) — ใช้เสียงบี๊บแทน")
+    if not used_voice:
+        play_loop(BEEP_BUY if fired == "ซื้อ" else BEEP_SELL, "audio/wav")
     st.button(f"🔕 ดับเสียง (สัญญาณ{fired})", use_container_width=True, type="primary",
               on_click=lambda: st.session_state.update(alarm_dismissed=True))
 
@@ -346,28 +390,31 @@ body = base.mark_bar(size=6).encode(
     x=x_enc, y="open:Q", y2="close:Q",
     color=alt.condition("datum.up", alt.value(UP), alt.value(DOWN)))
 
-# เส้น MA แบบมี legend บนกราฟ: ซื้อ=น้ำเงินทึบ / ขาย=ส้มเส้นประ
+# เส้น MA แบบมี legend บนกราฟ: ซื้อ=น้ำเงินทึบ / ขาย=ส้มเส้นประ / เทรน=ม่วงจุด
 buy_lbl, sell_lbl = f"MA ซื้อ ({ma_buy})", f"MA ขาย ({ma_sell})"
+trend_lbl = f"MA เทรน ({ma_trend})"
 ma_long = plot_df.melt(id_vars=["label", "order"],
-                       value_vars=["ma_buy", "ma_sell"],
+                       value_vars=["ma_buy", "ma_sell", "ma_trend"],
                        var_name="ma_type", value_name="ma_val")
-ma_long["ma_type"] = ma_long["ma_type"].map({"ma_buy": buy_lbl, "ma_sell": sell_lbl})
+ma_long["ma_type"] = ma_long["ma_type"].map(
+    {"ma_buy": buy_lbl, "ma_sell": sell_lbl, "ma_trend": trend_lbl})
+_dom = [buy_lbl, sell_lbl, trend_lbl]
 ma_line = alt.Chart(ma_long).mark_line(strokeWidth=2.2).encode(
     x=x_enc,
     y=alt.Y("ma_val:Q", scale=alt.Scale(zero=False)),
     color=alt.Color("ma_type:N",
-                    scale=alt.Scale(domain=[buy_lbl, sell_lbl],
-                                    range=["#2196f3", "#ff9800"]),
+                    scale=alt.Scale(domain=_dom,
+                                    range=["#2196f3", "#ff9800", "#9c27b0"]),
                     legend=alt.Legend(title=None, orient="top", labelFontSize=13)),
     strokeDash=alt.StrokeDash("ma_type:N",
-                              scale=alt.Scale(domain=[buy_lbl, sell_lbl],
-                                              range=[[1, 0], [6, 4]]),
+                              scale=alt.Scale(domain=_dom,
+                                              range=[[1, 0], [6, 4], [2, 3]]),
                               legend=None))
 
 chart = (wick + body + ma_line).properties(height=340).resolve_scale(color="independent")
 st.altair_chart(chart, use_container_width=True)
 st.caption(f"🕯️ {symbol} | เขียว=แท่งขึ้น  แดง=แท่งลง  "
-           f"(น้ำเงินทึบ=MA ซื้อ, ส้มเส้นประ=MA ขาย)")
+           f"(น้ำเงินทึบ=ซื้อ, ส้มประ=ขาย, ม่วงจุด=เทรน)")
 
 # ---- ประวัติสัญญาณ ----
 if st.session_state.get("signal_log"):
