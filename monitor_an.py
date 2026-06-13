@@ -49,15 +49,13 @@ def check_buy(df, tol):
     return (c1.close >= c1.ma_buy * (1 - tol)) and (c2.close >= c2.ma_buy * (1 - tol))
 
 
-def check_sell(df, tol):
-    if len(df) < 2:
+def check_sell(df, n_bars=2):
+    """ขาย: ราคาปิด 'ต่ำกว่า' MA ขาย ติดต่อกัน n_bars แท่ง (หรือมากกว่า)"""
+    sub = df.dropna(subset=["ma_sell"])
+    if len(sub) < n_bars:
         return False
-    c1, c2 = df.iloc[-2], df.iloc[-1]
-    if pd.isna(c1.ma_sell) or pd.isna(c2.ma_sell):
-        return False
-    cond1 = abs(c1.close - c1.ma_sell) <= c1.ma_sell * tol
-    cond2 = c2.close <= c2.ma_sell
-    return bool(cond1 and cond2)
+    tail = sub.iloc[-n_bars:]
+    return bool((tail["close"] < tail["ma_sell"]).all())
 
 
 def bars_above_below(df, ma_col):
@@ -107,9 +105,8 @@ def _resample_intraday(df, rule):
 
 
 @st.cache_data(ttl=45)
-def get_data(symbol: str, interval: str) -> pd.DataFrame:
+def get_data(yf_symbol: str, interval: str) -> pd.DataFrame:
     import yfinance as yf
-    yf_symbol = symbol if "." in symbol else f"{symbol}.BK"
 
     # 45 นาที: Yahoo ไม่มีให้ตรงๆ -> ดึง 15 นาทีมารวมเป็น 45 นาที
     if interval == "45m":
@@ -128,6 +125,17 @@ def get_data(symbol: str, interval: str) -> pd.DataFrame:
     raw = yf.download(yf_symbol, period=period, interval=interval,
                       progress=False, auto_adjust=False)
     return _to_df(raw)
+
+
+def resolve_symbol(sym: str, market: str) -> str:
+    """แปลงชื่อหุ้นเป็นรหัส Yahoo ตามตลาด"""
+    if not sym:
+        return sym
+    if "." in sym:                       # พิมพ์ suffix มาเอง เช่น 0700.HK, 7203.T
+        return sym
+    if market.startswith("ไทย"):
+        return f"{sym}.BK"
+    return sym                           # อเมริกา/อื่นๆ ใช้ชื่อตรงๆ เช่น AAPL
 
 
 # ===========================================================================
@@ -191,9 +199,13 @@ with st.sidebar:
                    unsafe_allow_html=True)
         return b
 
-    st.session_state.setdefault("symbol_input", "SINGER")
+    st.session_state.setdefault("symbol_input", "")
     symbol = row("Symbol").text_input(
-        "s", key="symbol_input", label_visibility="collapsed").strip().upper()
+        "s", key="symbol_input", placeholder="เช่น SINGER, AAPL",
+        label_visibility="collapsed").strip().upper()
+    market = row("ตลาด").selectbox(
+        "mk", ["ไทย (.BK)", "อเมริกา", "อื่นๆ (พิมพ์เต็ม)"],
+        index=0, label_visibility="collapsed")
 
     recent = st.session_state.setdefault("recent", [])
     if recent:
@@ -216,6 +228,8 @@ with st.sidebar:
                                           label_visibility="collapsed")
     touch_tol = row("Tolerance %").number_input(
         "tt", 0.0, 2.0, 0.1, 0.05, label_visibility="collapsed") / 100
+    sell_bars = row("แท่งปิดใต้ MA ขาย").number_input(
+        "sb", 1, 10, 2, 1, label_visibility="collapsed")
     chart_days = row("กราฟย้อนหลัง (วัน)").number_input(
         "cd", 1, 365, 3, 1, label_visibility="collapsed")
     ignore_forming = st.checkbox("ไม่นับแท่งที่กำลังวิ่ง (แนะนำเปิด)", value=True)
@@ -243,10 +257,16 @@ with st.sidebar:
               on_click=st.cache_data.clear)
 
 # ---- โหลดข้อมูล ----
-df = get_data(symbol, interval)
+if not symbol:
+    st.info("📈 พิมพ์ชื่อหุ้นในช่อง **Symbol** (แถบซ้าย) เพื่อเริ่มเฝ้าสัญญาณ\n\n"
+            "ไทย: SINGER, CBG, PTT　|　อเมริกา: AAPL, TSLA, NVDA")
+    st.stop()
+
+yf_symbol = resolve_symbol(symbol, market)
+df = get_data(yf_symbol, interval)
 if df.empty:
-    st.error(f"ดึงข้อมูล {symbol} ({tf_label}) ไม่ได้ — เช็คชื่อหุ้น (เช่น SINGER, "
-             f"CBG, PTT) หรือลองเปลี่ยน timeframe / กดดึงข้อมูลใหม่อีกครั้ง")
+    st.error(f"ดึงข้อมูล {symbol} ({yf_symbol}, {tf_label}) ไม่ได้ — เช็คชื่อหุ้น/ตลาด "
+             f"(ไทย: SINGER, CBG • อเมริกา: AAPL, TSLA) หรือลองเปลี่ยน timeframe")
     st.stop()
 
 # เก็บประวัติหุ้นที่เคยดู (ล่าสุดอยู่บน สูงสุด 10 ตัว)
@@ -268,7 +288,7 @@ if len(df) < need:
 
 df_eval = df.iloc[:-1].copy() if ignore_forming and len(df) > 1 else df.copy()
 buy_sig = check_buy(df_eval, touch_tol)
-sell_sig = check_sell(df_eval, touch_tol)
+sell_sig = check_sell(df_eval, sell_bars)
 
 last = df_eval.iloc[-1]
 price = float(last.close)          # ราคาแท่งที่ปิดแล้ว (ใช้ตัดสินสัญญาณ)
@@ -334,7 +354,7 @@ st.markdown(
 if buy_sig:
     st.success(f"🟢 **สัญญาณซื้อ {symbol} @ {price:.2f}** — 2 แท่งปิดแตะ/เหนือ MA ซื้อ")
 elif sell_sig:
-    st.error(f"🔴 **สัญญาณขาย {symbol} @ {price:.2f}** — แตะ แล้วแตะ/ต่ำกว่า MA ขาย")
+    st.error(f"🔴 **สัญญาณขาย {symbol} @ {price:.2f}** — ปิดต่ำกว่า MA ขาย {sell_bars} แท่งติด")
 else:
     st.warning("⏳ รอสัญญาณ — ยังไม่เข้าเงื่อนไข")
 
@@ -405,16 +425,12 @@ ma_line = alt.Chart(ma_long).mark_line(strokeWidth=2.2).encode(
     color=alt.Color("ma_type:N",
                     scale=alt.Scale(domain=_dom,
                                     range=["#2196f3", "#ff9800", "#9c27b0"]),
-                    legend=alt.Legend(title=None, orient="top", labelFontSize=13)),
-    strokeDash=alt.StrokeDash("ma_type:N",
-                              scale=alt.Scale(domain=_dom,
-                                              range=[[1, 0], [6, 4], [2, 3]]),
-                              legend=None))
+                    legend=alt.Legend(title=None, orient="top", labelFontSize=13)))
 
 chart = (wick + body + ma_line).properties(height=340).resolve_scale(color="independent")
 st.altair_chart(chart, use_container_width=True)
 st.caption(f"🕯️ {symbol} | เขียว=แท่งขึ้น  แดง=แท่งลง  "
-           f"(น้ำเงินทึบ=ซื้อ, ส้มประ=ขาย, ม่วงจุด=เทรน)")
+           f"(เส้นทึบ: น้ำเงิน=ซื้อ, ส้ม=ขาย, ม่วง=เทรน)")
 
 # ---- ประวัติสัญญาณ ----
 if st.session_state.get("signal_log"):
@@ -422,7 +438,7 @@ if st.session_state.get("signal_log"):
         st.dataframe(pd.DataFrame(st.session_state.signal_log[:20]),
                      use_container_width=True, hide_index=True)
 
-st.caption(f"ราคาจาก Yahoo ({symbol}.BK) อาจดีเลย์ ~15 นาที • ไม่ใช่คำแนะนำการลงทุน")
+st.caption(f"ราคาจาก Yahoo ({yf_symbol}) อาจดีเลย์ ~15 นาที • ไม่ใช่คำแนะนำการลงทุน")
 
 # ===========================================================================
 # auto-refresh — ตอนมีเสียงเตือนให้รีเฟรชถี่ (เสียงจะได้ตี๊ดต่อเนื่อง)
